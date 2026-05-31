@@ -1,819 +1,823 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ja">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>スーパーTANABEブラザーズ</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>スーパーTANABEブラザーズ 〜バルーンファイト〜</title>
 <style>
-  html,body{height:100%;margin:0;background:#0b3b62;display:flex;align-items:center;justify-content:center;font-family:monospace}
-  canvas{image-rendering:pixelated;border:8px solid #111; background:#6ad}
-  .overlay{position:fixed;left:8px;top:8px;color:#fff;font-size:12px}
+  html,body{height:100%;margin:0;background:#7ec0ff;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,Segoe UI,Roboto,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif}
+  #container{width:90vmin;max-width:720px;aspect-ratio:256/240;position:relative}
+  canvas{width:100%;height:100%;image-rendering:pixelated;background:linear-gradient(#87CEEB,#bfefff);display:block;border:6px solid #222;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+  #overlay{position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none}
+  .hud{position:absolute;color:#fff;text-shadow:0 1px 0 #000, 0 -1px 0 rgba(0,0,0,0.3);font-weight:700;letter-spacing:1px}
+  #title{left:8px;top:8px;font-size:12px}
+  #scores{right:8px;top:8px;text-align:right;font-size:12px}
+  #instructions{left:8px;bottom:8px;font-size:11px}
+  button{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:12px 20px;font-size:18px;border-radius:8px;border:none;background:#ffde59;color:#111;cursor:pointer;box-shadow:0 4px #b38600}
+  @media (hover:none){button{font-size:16px}}
+  /* tiny mobile hint */
+  #touchHint{position:absolute;left:50%;bottom:8px;transform:translateX(-50%);color:#fff;font-size:12px}
 </style>
 </head>
 <body>
-<canvas id="screen"></canvas>
+<div id="container">
+  <canvas id="game" width="256" height="240"></canvas>
+  <div id="overlay">
+    <div id="title" class="hud">スーパーTANABEブラザーズ 〜バルーンファイト〜</div>
+    <div id="scores" class="hud"></div>
+    <div id="instructions" class="hud" style="left:8px;bottom:8px">1P: WASD (W=flap). 2P: ↑←→. Touch: left=P1, right=P2</div>
+    <div id="touchHint"></div>
+  </div>
+</div>
+
 <script>
 /*
-  スーパーTANABEブラザーズ
-  Single-file HTML5 Canvas game with 2-player local co-op.
-  Controls: P1 WASD (W jump), P2 Arrow keys (Up jump)
-  Mobile: left half tap = P1 jump, right half tap = P2 jump
+スーパーTANABEブラザーズ 〜バルーンファイト〜
+Single HTML file game inspired by Balloon Fight (1984)
+Features:
+- Two playable characters with pixel-face details (Takeshi and Kenji)
+- 3 AI balloon enemies
+- Platforms (clouds), side lightning hazards, balloons, physics, AI
+- WebAudio 8-bit BGM & SFX
+- Keyboard + touch controls
+- Title screen, win/gameover, retry
+
+Author: Fun AI implementation
 */
 
-// Basic settings
-const TILE = 16;                     // tile pixel size in source
-const V_WIDTH = 320;                 // virtual canvas width
-const V_HEIGHT = 192;                // virtual canvas height
-const LEVEL_TILES = 200;             // level width in tiles
-const GRAVITY = 0.6;
-const MAX_FALL = 12;
-const FPS = 60;
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const overlayScores = document.getElementById('scores');
+  const touchHint = document.getElementById('touchHint');
+  // Pixel scale for drawing pixel-art sprites
+  const PS = 2; // pixel size multiplier for internal sprite drawing
 
-// Canvas setup
-const canvas = document.getElementById('screen');
-const ctx = canvas.getContext('2d', { alpha: false });
-let scale = 2;
-function resize() {
-  const availW = window.innerWidth - 40;
-  const availH = window.innerHeight - 40;
-  scale = Math.floor(Math.min(availW / V_WIDTH, availH / V_HEIGHT));
-  if (scale < 1) scale = 1;
-  canvas.width = V_WIDTH * scale;
-  canvas.height = V_HEIGHT * scale;
-  canvas.style.width = (V_WIDTH * scale) + 'px';
-  canvas.style.height = (V_HEIGHT * scale) + 'px';
-  ctx.setTransform(scale,0,0,scale,0,0);
-}
-window.addEventListener('resize', resize);
-resize();
+  // Audio setup
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AudioContextClass();
+  let bgmOsc = null;
+  let bgmGain = null;
+  let bgmTimer = null;
 
-// Game state
-let gameState = 'title'; // title, playing, level_end, gameover
-let titleTick = 0;
-let lastTime = performance.now();
-let acc = 0;
+  function startBGM() {
+    if (!audioCtx) return;
+    stopBGM();
+    audioCtx.resume();
+    bgmGain = audioCtx.createGain();
+    bgmGain.gain.value = 0.12;
+    bgmGain.connect(audioCtx.destination);
 
-// Camera
-let camX = 0;
-
-// Level: array of tile codes. 0 empty,1 ground,2 brick,3 question,4 coin tile (visual),5 pipe,6 goal pole base
-const LEVEL_W = LEVEL_TILES;
-const LEVEL = new Array(LEVEL_W).fill(0);
-const TILE_COLORS = {
-  1: '#5d3b1b', // ground
-  2: '#b73b3b', // brick
-  3: '#dcae3a', // ?
-  4: '#ffd24a', // coin tile
-  5: '#3aa',    // pipe
-  6: '#222'
-};
-
-// Entities arrays
-let coins = [];
-let blocks = [];
-let enemies = [];
-let particles = [];
-let projectiles = [];
-let HUD = { time: 400, score: 0, coins: 0 };
-
-// Players
-class Player {
-  constructor(x,y, config) {
-    this.x = x; this.y = y;
-    this.w = 12; this.h = 16;
-    this.vx = 0; this.vy = 0;
-    this.onGround = false;
-    this.facing = 1;
-    this.name = config.name;
-    this.isP1 = config.isP1;
-    this.color = config.color;
-    this.lives = 3;
-    this.coins = 0;
-    this.score = 0;
-    this.big = false;
-    this.bigTimer = 0;
-    this.star = false;
-    this.starTimer = 0;
-    this.canDouble = config.canDouble; // Takeshi double jump
-    this.jumps = 0;
-    this.speed = config.speed || 1.2;
-    this.jumpPower = config.jumpPower || -9;
-    this.wallKick = config.wallKick || false;
-    this.widthPixels = 12;
-    this.heightPixels = 16;
-    this.dead = false;
-  }
-  reset(x,y) {
-    this.x = x; this.y = y; this.vx=0; this.vy=0; this.onGround=false; this.jumps=0; this.dead=false;
-    this.big = false; this.bigTimer = 0; this.star=false; this.starTimer=0;
-  }
-}
-const players = [
-  new Player(40, 50, { name:'兄 TAKESHI', isP1:true, color:'#111', canDouble:true, speed:1.6, jumpPower:-8 }),
-  new Player(60, 50, { name:'弟 KENJI', isP1:false, color:'#8b5', canDouble:false, speed:1.2, jumpPower:-11, wallKick:true })
-];
-
-// Input
-const keys = {};
-window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if(gameState==='title' && e.key==='Enter') startGame(); if(e.key==='Escape') gameState='title';});
-window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
-
-// Touch controls: left half tap -> P1 jump, right half -> P2 jump
-window.addEventListener('touchstart', e => {
-  e.preventDefault();
-  for (let t of e.touches) {
-    if (t.clientX < window.innerWidth/2) playerJump(players[0]);
-    else playerJump(players[1]);
-  }
-}, {passive:false});
-
-// Simple audio - 8-bit BGM and sound effects
-const AudioCtx = window.AudioContext || window.webkitAudioContext;
-const audioCtx = AudioCtx ? new AudioCtx() : null;
-let bgmGain, bgmOsc;
-function startBGM() {
-  if (!audioCtx) return;
-  if (bgmOsc) stopBGM();
-  bgmGain = audioCtx.createGain();
-  bgmGain.gain.value = 0.18;
-  bgmGain.connect(audioCtx.destination);
-  let t = audioCtx.currentTime;
-  // simple sequence using oscillator scheduling
-  bgmOsc = audioCtx.createOscillator();
-  bgmOsc.type = 'square';
-  bgmOsc.frequency.setValueAtTime(220, t);
-  bgmOsc.connect(bgmGain);
-  bgmOsc.start();
-  // modulate freq to make a chiptune-like loop
-  let seq = [392, 440, 494, 523, 440, 392, 349, 330];
-  let i=0;
-  const loop = () => {
-    if (!bgmOsc) return;
-    bgmOsc.frequency.setValueAtTime(seq[i%seq.length], audioCtx.currentTime);
-    i++;
-    setTimeout(loop, 180);
-  };
-  loop();
-}
-function stopBGM() {
-  if (!audioCtx) return;
-  try { bgmOsc.stop(); } catch(e){}
-  bgmOsc = null;
-  bgmGain = null;
-}
-function sfx(type) {
-  if (!audioCtx) return;
-  const t = audioCtx.currentTime;
-  const g = audioCtx.createGain();
-  g.gain.value = 0.12;
-  g.connect(audioCtx.destination);
-  const o = audioCtx.createOscillator();
-  o.type = 'square';
-  switch(type) {
-    case 'jump': o.frequency.setValueAtTime(880, t); g.gain.linearRampToValueAtTime(0.02,t+0.3); break;
-    case 'coin': o.frequency.setValueAtTime(1320, t); g.gain.linearRampToValueAtTime(0.02,t+0.2); break;
-    case 'power': o.frequency.setValueAtTime(660, t); g.gain.linearRampToValueAtTime(0.02,t+0.7); break;
-    case 'stomp': o.frequency.setValueAtTime(220, t); g.gain.linearRampToValueAtTime(0.02,t+0.25); break;
-    case 'die': o.frequency.setValueAtTime(110, t); g.gain.linearRampToValueAtTime(0.02,t+0.6); break;
-    default: o.frequency.setValueAtTime(440, t); g.gain.linearRampToValueAtTime(0.02,t+0.2);
-  }
-  o.connect(g);
-  o.start();
-  o.stop(t + 0.25 + Math.random()*0.4);
-}
-
-// Helper functions
-function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
-function randInt(a,b){return Math.floor(Math.random()*(b-a+1))+a;}
-
-// Build procedural-ish level
-function buildLevel() {
-  for (let i=0;i<LEVEL_W;i++) LEVEL[i]=0;
-  const groundY = Math.floor(V_HEIGHT / TILE) - 2; // two tiles from bottom
-  // flat start
-  for (let i=0;i<10;i++) LEVEL[i] = 1;
-  // ground across
-  for (let x=0;x<LEVEL_W;x++) {
-    if (x<10) continue;
-    // create occasional gaps
-    if (x>20 && Math.random()<0.04 && x<LEVEL_W-20) {
-      // gap of 1-3
-      const gap = randInt(1,3);
-      for (let g=0;g<gap;g++) LEVEL[x+g]=0;
-      x += gap-1;
-      continue;
-    }
-    // pipe
-    if (Math.random()<0.03 && x<LEVEL_W-6) {
-      LEVEL[x] = 5; LEVEL[x+1]=0; LEVEL[x+2]=1;
-      x+=2; continue;
-    }
-    // place some bricks and ? blocks
-    if (Math.random()<0.12) {
-      LEVEL[x] = 1;
-      if (Math.random()<0.6 && x<LEVEL_W-2) {
-        LEVEL[x] = 1;
-        blocks.push({x:x, type: 2}); // brick above ground
-        // represent a brick at tile above ground. We'll track it separately
-      } else if (Math.random()<0.3) {
-        blocks.push({x:x, type:3, content: (Math.random()<0.6?'coin': (Math.random()<0.5?'mushroom':'star')), used:false});
-      }
-    } else {
-      LEVEL[x] = 1;
-    }
-    // random small hill: set ground tile to 1 but we can add floating platforms later
-  }
-  // Goal pole near end
-  const goalX = LEVEL_W - 10;
-  LEVEL[goalX] = 6;
-  // Add floating coins and platforms
-  for (let i=20;i<LEVEL_W-20;i+=10) {
-    if (Math.random()<0.6) {
-      const height = randInt(3,6);
-      // create 3 tile wide floating platform
-      for (let w=0;w<3;w++) {
-        blocks.push({x:i+w, y:height, type:2, floating:true});
-      }
-      if (Math.random()<0.6) {
-        // coins above
-        for (let c=0;c<3;c++) coins.push({x:i+c+0.5, y:height-1.5, collected:false});
+    // simple square wave melody sequence
+    const tempo = 120;
+    const beat = 60 / tempo;
+    const notes = [
+      // [freq, duration in beats]
+      [880, 1/2],[988,1/2],[1047,1],[0,1/4],[880,1/2],[988,1/2],[1175,1],[0,1],
+      [784,1/2],[880,1/2],[988,1],[0,1/4],[784,1/2],[880,1/2],[1047,1],[0,1]
+    ];
+    let t = audioCtx.currentTime + 0.05;
+    // schedule once then loop by setInterval simple
+    function scheduleOnce() {
+      t = audioCtx.currentTime + 0.05;
+      for (let i=0;i<notes.length;i++){
+        const [freq, dur] = notes[i];
+        if (freq>0){
+          const osc = audioCtx.createOscillator();
+          osc.type = 'square';
+          osc.frequency.value = freq;
+          const g = audioCtx.createGain();
+          g.gain.value = 0.18;
+          g.gain.setValueAtTime(0.18, t);
+          g.gain.exponentialRampToValueAtTime(0.0001, t + dur * beat * 0.95);
+          osc.connect(g); g.connect(bgmGain);
+          osc.start(t); osc.stop(t + dur * beat);
+        }
+        t += dur * beat;
       }
     }
+    scheduleOnce();
+    bgmTimer = setInterval(scheduleOnce, (notes.reduce((a,b)=>a+b[1],0) * beat) * 1000);
   }
-  // spawn some enemies
-  for (let i=15;i<LEVEL_W-15;i+=8) {
-    if (Math.random()<0.4) enemies.push({type:'goomba', x:i*1.0+0.5, y:groundY-1, vx: (Math.random()<0.5?-0.4:0.4), dead:false});
-    else if (Math.random()<0.2) enemies.push({type:'koopa', x:i*1.0+0.5, y:groundY-1, vx: (Math.random()<0.5?-0.25:0.25), dead:false});
-    if (Math.random()<0.12) enemies.push({type:'fly', x:i*1.0+0.5, y:groundY-4, vx: (Math.random()<0.5?-0.3:0.3), sinOff: Math.random()*10, dead:false});
+  function stopBGM(){
+    if (bgmTimer) { clearInterval(bgmTimer); bgmTimer = null; }
+    bgmGain = null;
   }
-}
 
-buildLevel();
+  // Sound effects (simple)
+  function sfxPop() {
+    const ctxA = audioCtx;
+    if(!ctxA) return;
+    const o = ctxA.createOscillator();
+    const g = ctxA.createGain();
+    o.type = 'square';
+    o.frequency.value = 1200;
+    g.gain.value = 0.0001;
+    o.connect(g); g.connect(ctxA.destination);
+    const t = ctxA.currentTime;
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.exponentialRampToValueAtTime(0.00001, t+0.25);
+    o.start(t); o.stop(t+0.25);
 
-// Utility collision with tiles
-function tileAt(tx) {
-  if (tx < 0 || tx >= LEVEL_W) return 0;
-  return LEVEL[tx] || 0;
-}
-
-// Brick/block state map keyed by x and y for floating platforms
-let brickMap = {};
-function rebuildBrickMap() {
-  brickMap = {};
-  for (let b of blocks) {
-    const key = (b.x|0) + ',' + ((b.y !== undefined) ? (b.y|0) : ('ground'));
-    brickMap[key] = Object.assign({}, b);
+    // noise
+    const bufferSize = ctxA.sampleRate * 0.08;
+    const buffer = ctxA.createBuffer(1, bufferSize, ctxA.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0;i<bufferSize;i++) data[i] = (Math.random()*2-1)*Math.exp(-i/bufferSize*6);
+    const noise = ctxA.createBufferSource();
+    const ng = ctxA.createGain();
+    noise.buffer = buffer; ng.gain.value = 0.3;
+    noise.connect(ng); ng.connect(ctxA.destination);
+    noise.start(t); noise.stop(t+0.08);
   }
-}
-rebuildBrickMap();
+  function sfxJump() {
+    const ctxA = audioCtx;
+    if(!ctxA) return;
+    const o = ctxA.createOscillator();
+    const g = ctxA.createGain();
+    o.type = 'sine';
+    o.frequency.value = 600;
+    g.gain.value = 0.1;
+    o.connect(g); g.connect(ctxA.destination);
+    const t = ctxA.currentTime;
+    g.gain.setValueAtTime(0.1,t);
+    g.gain.exponentialRampToValueAtTime(0.00001,t+0.18);
+    o.frequency.setValueAtTime(600,t);
+    o.frequency.exponentialRampToValueAtTime(100,t+0.18);
+    o.start(t); o.stop(t+0.18);
+  }
+  function sfxFall() {
+    const ctxA = audioCtx;
+    if(!ctxA) return;
+    const o = ctxA.createOscillator();
+    const g = ctxA.createGain();
+    o.type = 'sawtooth';
+    o.frequency.value = 220;
+    g.gain.value = 0.08;
+    o.connect(g); g.connect(ctxA.destination);
+    const t = ctxA.currentTime;
+    g.gain.setValueAtTime(0.08,t);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.6);
+    o.frequency.exponentialRampToValueAtTime(80,t+0.6);
+    o.start(t); o.stop(t+0.6);
+  }
+  function sfxWin() {
+    const ctxA = audioCtx;
+    if(!ctxA) return;
+    const now = ctxA.currentTime;
+    const freqs=[880,1047,1319];
+    freqs.forEach((f,i)=>{
+      const o = ctxA.createOscillator();
+      const g = ctxA.createGain();
+      o.type='square'; o.frequency.value=f;
+      g.gain.value=0.08;
+      o.connect(g); g.connect(ctxA.destination);
+      o.start(now + i*0.15); o.stop(now + i*0.15 + 0.28);
+      g.gain.setValueAtTime(0.08, now + i*0.15);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + i*0.15 + 0.28);
+    });
+  }
 
-// Spawn a coin
-function spawnCoin(x,y) {
-  coins.push({x:x, y:y, collected:false, vy:-2, tick:0});
-}
+  // Game states
+  let state = 'title'; // title, play, win, gameover
+  let entities = []; // all actors: players + enemies
+  let players = []; // references to player entities (2)
+  let platforms = [];
+  let hazards = {left:false,right:false, timer:0};
+  let lastTimestamp = 0;
+  let gravity = 0.25;
+  let wind = 0;
+  let keys = {};
+  let touchMap = {}; // pointerId -> 'p1' or 'p2'
+  let mobileControlsActive = false;
+  let score = {p1:0,p2:0};
 
-// Player actions
-function playerJump(p) {
-  if (p.dead) return;
-  if (p.onGround) {
-    p.vy = p.jumpPower;
-    p.onGround = false;
-    p.jumps = 1;
-    sfx('jump');
-  } else {
-    // double jump for Takeshi
-    if (p.canDouble && p.jumps < 2) {
-      p.vy = p.jumpPower * 0.85;
-      p.jumps++;
-      sfx('jump');
-    } else if (p.wallKick) {
-      // wall kick: if touching wall horizontally and in air, bounce off
-      const leftTile = tileAt(Math.floor((p.x-1)/1));
-      const rightTile = tileAt(Math.floor((p.x+1)/1));
-      // we do a simpler check using x position against camera boundaries: if near a tile that is solid
-      // Check wall tiles near player's tile position
-      const tileX = Math.floor(p.x/1);
-      if (tileAt(tileX-1) === 1) { p.vx = 3; p.vy = p.jumpPower; sfx('jump'); }
-      else if (tileAt(tileX+1) === 1) { p.vx = -3; p.vy = p.jumpPower; sfx('jump'); }
+  // Create world platforms (clouds)
+  function setupPlatforms() {
+    platforms = [];
+    platforms.push({x:16,y:200,w:80,h:12}); // lower left
+    platforms.push({x:160,y:190,w:84,h:12}); // lower right
+    platforms.push({x:48,y:120,w:72,h:12}); // mid left
+    platforms.push({x:140,y:80,w:80,h:12}); // high right
+    // make two or three visible clouds (we'll draw them)
+  }
+
+  // Entity factory
+  function makePlayer(id, name, x, y, controls, portrait) {
+    return {
+      type: 'player',
+      id,
+      name,
+      x, y,
+      prevX: x, prevY: y,
+      vx: 0, vy: 0,
+      ax: 0,
+      radius: 10,
+      color: '#fff',
+      balloons: 2,
+      invuln: 0,
+      onPlatform: false,
+      facing: 1,
+      score: 0,
+      controls,
+      portrait, // 'takeshi' or 'kenji'
+      isHuman: true,
+      aiTimer: 0
+    };
+  }
+
+  function makeEnemy(id, x, y, colorA, colorB) {
+    return {
+      type: 'enemy',
+      id,
+      name: 'ENEMY',
+      x,y,
+      prevX:x,prevY:y,
+      vx: (Math.random()>0.5?1:-1)*0.6,
+      vy: 0,
+      ax:0,
+      radius: 9,
+      color: '#f88',
+      balloons: 2,
+      invuln: 0,
+      onPlatform: false,
+      facing: 1,
+      isHuman:false,
+      aiTimer: Math.random()*2
+    };
+  }
+
+  function resetGame() {
+    entities = [];
+    players = [];
+    setupPlatforms();
+    hazards = {left:false,right:false,timer:0};
+
+    // Create players with portraits and starting positions
+    const p1 = makePlayer(1, 'TAKESHI', 80, 160, {left:'a',right:'d',flap:'w'}, 'takeshi');
+    const p2 = makePlayer(2, 'KENJI', 176, 160, {left:'ArrowLeft',right:'ArrowRight',flap:'ArrowUp'}, 'kenji');
+
+    players.push(p1,p2);
+    entities.push(p1,p2);
+
+    // Create 3 enemies
+    const ecount = 3 + Math.floor(Math.random()*2);
+    for(let i=0;i<ecount;i++){
+      const ex = 40 + i*60;
+      const ey = 40 + Math.random()*80;
+      entities.push(makeEnemy(100+i, ex, ey, '#6cf', '#fff'));
     }
+
+    score = {p1:0,p2:0};
+    lastTimestamp = 0;
+    state = 'play';
+    startBGM();
   }
-}
 
-// Main loop
-function startGame() {
-  // reset everything
-  coins = []; blocks = []; enemies = []; particles = [];
-  HUD = { time: 400, score: 0, coins: 0 };
-  buildLevel();
-  blocks.push({x:12, type:3, content:'mushroom', used:false});
-  rebuildBrickMap();
-  players[0].reset(40,50);
-  players[1].reset(60,50);
-  players[0].lives = 3; players[1].lives = 3;
-  gameState = 'playing';
-  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
-  startBGM();
-}
-function gameOver() {
-  stopBGM();
-  gameState = 'gameover';
-}
-
-// Game update
-function update(dt) {
-  titleTick += dt;
-  if (gameState === 'playing') {
-    HUD.time -= dt/1000;
-    if (HUD.time <= 0) {
-      // Time up => lose life for both?
-      for (let p of players) p.lives = Math.max(0, p.lives-1);
-      HUD.time = 0;
-      sfx('die');
-      // check gameover
-      if (players.every(p=>p.lives<=0)) gameOver();
+  // Input handling
+  window.addEventListener('keydown', (e) => {
+    keys[e.key] = true;
+    if (state === 'title' && e.key === 'Enter') {
+      resetGame();
+    } else if ((state === 'win' || state === 'gameover') && e.key === 'Enter') {
+      state = 'title';
     }
-    // Input for players
-    // Player 1 WASD
-    const p1 = players[0], p2 = players[1];
-    // Horizontal move
-    if (keys['a']) { p1.vx = -p1.speed; p1.facing = -1; } else if (keys['d']) { p1.vx = p1.speed; p1.facing = 1; } else { p1.vx *= 0.8; if (Math.abs(p1.vx)<0.01) p1.vx=0; }
-    if (keys['w'] && !p1._wPrev) { playerJump(p1); } p1._wPrev = keys['w'];
-    // Player 2 arrows
-    if (keys['arrowleft']) { p2.vx = -p2.speed; p2.facing = -1; } else if (keys['arrowright']) { p2.vx = p2.speed; p2.facing = 1; } else { p2.vx *= 0.8; if (Math.abs(p2.vx)<0.01) p2.vx=0; }
-    if (keys['arrowup'] && !p2._upPrev) { playerJump(p2); } p2._upPrev = keys['arrowup'];
+  });
+  window.addEventListener('keyup', (e) => {
+    keys[e.key] = false;
+  });
 
-    // update players physics
-    for (let p of players) {
-      if (p.dead) continue;
-      p.vy += GRAVITY;
-      p.vy = clamp(p.vy, -999, MAX_FALL);
-      // move horizontally in small steps for collision
-      let nx = p.x + p.vx;
-      let ny = p.y + p.vy;
-      // convert to tile coords
-      // ground is at bottom tiles of LEVEL: we assume ground tiles exist at y = groundY...
-      const maxYTile = Math.floor(V_HEIGHT / TILE) - 2;
-      // Horizontal collision with tiles based on simple ground and pipes
-      // Check tile under player's feet for platform detection
-      p.onGround = false;
-      // approximate player's tile coordinate
-      const tileBelow = Math.floor((p.y + p.h/PIX_SCALE())/TILE);
-      // Actually simpler: treat floor at bottom if y+height exceeds certain pixel pos
-      const floorY = V_HEIGHT - TILE*2;
-      if (p.y + p.h >= floorY) {
-        p.y = floorY - p.h;
-        p.vy = 0;
-        p.onGround = true;
-        p.jumps = 0;
+  // Touch controls: left half => P1 flap, right half => P2 flap
+  canvas.addEventListener('touchstart', (ev) => {
+    mobileControlsActive = true;
+    touchHint.textContent = 'Touch mode: tap left for 1P, right for 2P';
+    ev.preventDefault();
+    for (let t of ev.changedTouches) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (t.clientX - rect.left) * (canvas.width / rect.width);
+      if (x < canvas.width/2) {
+        touchMap[t.identifier] = 'p1';
+        handleFlap(players[0]);
       } else {
-        p.y = ny;
+        touchMap[t.identifier] = 'p2';
+        handleFlap(players[1]);
       }
-      p.x = nx;
-      // Collect coins (tileless) and collisions with enemies
-      // coin collisions
-      for (let c of coins) {
-        if (c.collected) continue;
-        if (Math.abs((p.x+6) - (c.x*TILE)) < 12 && Math.abs((p.y+8) - (c.y*TILE)) < 12) {
-          c.collected = true; HUD.coins++; HUD.score += 200; sfx('coin');
+    }
+  }, {passive:false});
+
+  canvas.addEventListener('touchend', (ev) => {
+    ev.preventDefault();
+    for (let t of ev.changedTouches) {
+      delete touchMap[t.identifier];
+    }
+  }, {passive:false});
+
+  canvas.addEventListener('mousedown', (ev) => {
+    // Click: start from title or flap both? On title, start. During play: flap nearest side
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) * (canvas.width / rect.width);
+    if (state === 'title') {
+      resetGame();
+      return;
+    }
+    if (state === 'win' || state === 'gameover') {
+      state = 'title';
+      stopBGM();
+      return;
+    }
+    if (x < canvas.width/2) handleFlap(players[0]); else handleFlap(players[1]);
+  });
+
+  function handleFlap(ent) {
+    if (!ent || ent.balloons<=0) return;
+    // apply flap impulse
+    ent.vy = -4.4;
+    sfxJump();
+    ent.onPlatform = false;
+  }
+
+  // Physics and update
+  function update(dt) {
+    if (state !== 'play') return;
+
+    // hazards timer
+    hazards.timer += dt;
+    if (hazards.timer > 2000) {
+      hazards.timer = 0;
+      hazards.left = Math.random() < 0.5;
+      hazards.right = Math.random() < 0.6;
+      // hazards active for a short time
+      setTimeout(()=>{hazards.left=false;hazards.right=false}, 700);
+    }
+
+    // AI and inputs
+    for (let ent of entities) {
+      ent.prevX = ent.x; ent.prevY = ent.y;
+      // reduce invulnerability
+      if (ent.invuln > 0) ent.invuln = Math.max(0, ent.invuln - dt/16);
+      // input for players
+      if (ent.type === 'player') {
+        // Horizontal movement
+        let move = 0;
+        if (ent.controls) {
+          if (keys[ent.controls.left]) move -= 1;
+          if (keys[ent.controls.right]) move += 1;
+        }
+        // Touch continuous movement not implemented; only flap via touch
+        // Apply acceleration
+        ent.vx += move * 0.14;
+        ent.vx *= 0.92;
+
+        // Flap (key)
+        if (keys[ent.controls.flap]) {
+          if (ent.balloons>0 && ent.vy > -5) {
+            ent.vy = ent.vy - 0.8 - Math.random()*0.2;
+            ent.onPlatform = false;
+            sfxJump();
+          }
+        }
+
+      } else if (ent.type === 'enemy') {
+        // simple AI: travel horizontally, flap occasionally to stay afloat, try to target nearest player
+        ent.aiTimer -= dt/1000;
+        if (ent.aiTimer <= 0) {
+          ent.aiTimer = 0.6 + Math.random()*1.2;
+          // decide to flap sometimes, or change direction
+          if (Math.random() < 0.6) {
+            if (ent.balloons>0) ent.vy = -3 - Math.random()*1.5;
+          }
+          if (Math.random() < 0.5) ent.vx *= -1;
+          // gently home towards nearest player if below or above
+          let target = players[Math.floor(Math.random()*players.length)];
+          if (target && target.balloons>0) {
+            if (target.x < ent.x) ent.vx = -0.6 - Math.random()*0.6;
+            else ent.vx = 0.6 + Math.random()*0.6;
+            if (target.y < ent.y && Math.random()<0.6) ent.vy = -3 - Math.random()*1;
+          }
+        }
+        // apply friction
+        ent.vx *= 0.995;
+      }
+
+      // gravity: if balloons==0 sink faster
+      const gg = ent.balloons > 0 ? gravity : gravity*2.6;
+      ent.vy += gg + wind*0.01;
+      ent.x += ent.vx;
+      ent.y += ent.vy;
+
+      // world bounds
+      if (ent.x < 8) { ent.x = 8; ent.vx = Math.abs(ent.vx); }
+      if (ent.x > W-8) { ent.x = W-8; ent.vx = -Math.abs(ent.vx); }
+      if (ent.y < 8) { ent.y = 8; ent.vy = 0; }
+      if (ent.y > H + 60) {
+        // fallen out of screen
+        if (ent.balloons > 0) ent.balloons = 0; // ensure popped
+        ent.vx = 0; ent.vy = 0;
+      }
+
+      // Landing on platforms (only when moving downward)
+      ent.onPlatform = false;
+      for (let p of platforms) {
+        const topY = p.y;
+        if (ent.prevY + ent.radius <= topY && ent.y + ent.radius >= topY) {
+          // horizontally within platform range (slight tolerance)
+          if (ent.x > p.x - 8 && ent.x < p.x + p.w + 8) {
+            // land
+            ent.y = topY - ent.radius;
+            ent.vy = -1.2; // small bounce
+            ent.onPlatform = true;
+            // small bounce reduces when balloon popped
+            if (ent.balloons <= 0) {
+              ent.vy = 2; // sink off platform
+              ent.onPlatform = false;
+            }
+          }
         }
       }
-      // Block hit from below (simulate hitting blocks when jumping)
-      // If player moving up and intersects any block above: check blocks array for bricks at tile above player's head position
-      if (p.vy < 0) {
-        // find blocks with x matching
-        for (let b of blocks) {
-          const bx = (b.x|0)*TILE;
-          const by = ((b.y !== undefined)? b.y : 0);
-        }
+
+      // Hazards on sides: lightning can pop balloons if near edges when active
+      if (ent.x < 18 && hazards.left && ent.balloons>0 && ent.invuln<=0) {
+        ent.balloons--;
+        ent.invuln = 60;
+        sfxPop();
       }
-      // Big mode timer
-      if (p.big) {
-        p.bigTimer -= dt/1000;
-        if (p.bigTimer <= 0) { p.big = false; sfx('die'); }
+      if (ent.x > W-18 && hazards.right && ent.balloons>0 && ent.invuln<=0) {
+        ent.balloons--;
+        ent.invuln = 60;
+        sfxPop();
       }
-      if (p.star) {
-        p.starTimer -= dt/1000;
-        if (p.starTimer <= 0) { p.star = false; sfx('die'); }
-      }
+
+      // Cap speeds
+      ent.vy = Math.max(ent.vy, -6.5);
+      ent.vy = Math.min(ent.vy, 12);
+      ent.vx = Math.max(Math.min(ent.vx, 4), -4);
     }
 
-    // Simpler tile interactions: we'll detect collisions with ground tiles for enemies and limited brick interactions when jumping into ? blocks.
-    // Process enemy motion and collisions with players
-    for (let e of enemies) {
-      if (e.dead) continue;
-      if (e.type === 'fly') {
-        e.x += e.vx;
-        e.y += Math.sin((performance.now()/200)+e.sinOff)*0.03 + 0.02;
-      } else {
-        e.x += e.vx;
-      }
-      // basic ground collision: keep at ground
-      const groundY = Math.floor(V_HEIGHT / TILE) - 3;
-      e.y = Math.max(e.y, groundY);
-      // wrap or die at edges
-      if (e.x < 0 || e.x > LEVEL_W) e.dead = true;
-    }
-    // Remove dead enemies occasionally
-    enemies = enemies.filter(e => !e.dead);
-
-    // Check player-enemy interactions
-    for (let p of players) {
-      if (p.dead) continue;
-      for (let e of enemies) {
-        if (e.dead) continue;
-        const dx = (p.x + p.widthPixels/2) - (e.x * TILE + TILE/2);
-        const dy = (p.y + p.heightPixels/2) - (e.y * TILE + TILE/2);
-        if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
-          if (p.vy > 0 && dy < 6) {
-            // player stomps enemy
-            e.dead = true;
-            sfx('stomp');
-            p.vy = -6;
-            HUD.score += 100;
-          } else if (p.star) {
-            e.dead = true; HUD.score += 200; sfx('stomp');
+    // Collisions between entities: bump into opponent/enemy to pop one balloon
+    // We'll detect overlapping and determine who initiated the overlap by previous positions.
+    for (let i=0;i<entities.length;i++){
+      for (let j=i+1;j<entities.length;j++){
+        const a = entities[i], b = entities[j];
+        if (!a || !b) continue;
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const dist = Math.hypot(dx,dy);
+        if (dist < a.radius + b.radius - 1) {
+          // overlapping -> determine who moved into whom by checking previous positions
+          const prevDx = (a.prevX - b.prevX), prevDy = (a.prevY - b.prevY);
+          const prevDist = Math.hypot(prevDx, prevDy);
+          // If a approached b (prevDist > dist), then a "hit" b.
+          if (prevDist > dist + 0.2) {
+            // a hit b
+            if (b.balloons>0 && b.invuln<=0) {
+              b.balloons--;
+              b.invuln = 40;
+              // knockback
+              const nx = dx / (dist+0.01);
+              b.vx += nx * 1.6;
+              b.vy -= 2.0;
+              sfxPop();
+              // scoring if player hits enemy or other player
+              if (a.type === 'player') {
+                if (a.id === 1) score.p1++;
+                else if (a.id === 2) score.p2++;
+                a.score++;
+              }
+            }
+          } else if (prevDist < dist - 0.2) {
+            // b moved into a
+            if (a.balloons>0 && a.invuln<=0) {
+              a.balloons--;
+              a.invuln = 40;
+              const nx = -dx / (dist+0.01);
+              a.vx += nx * 1.6;
+              a.vy -= 2.0;
+              sfxPop();
+              if (b.type === 'player') {
+                if (b.id === 1) score.p1++;
+                else if (b.id === 2) score.p2++;
+                b.score++;
+              }
+            }
           } else {
-            // player hurt
-            p.lives--; sfx('die');
-            p.dead = true;
-            setTimeout(()=>{ p.reset(40 + (p.isP1?0:20), 50); }, 1000);
-            if (players.every(pl=>pl.lives<=0)) gameOver();
+            // ambiguous: both bounce apart a bit
+            const nx = dx / (dist+0.01);
+            a.vx += nx * 0.6; b.vx -= nx * 0.6;
+            a.vy -= 0.8; b.vy -= 0.8;
           }
         }
       }
     }
 
-    // Update coins animation
-    for (let c of coins) {
-      if (c.collected) continue;
-      c.tick += dt/1000;
-      c.y += c.vy;
-      c.vy += GRAVITY*0.2;
-    }
-    // Camera follow both players: center between players
-    const avgX = (players[0].x + players[1].x) / 2;
-    camX = clamp(avgX - V_WIDTH/2, 0, LEVEL_W * TILE - V_WIDTH);
-
-    // Goal detection
-    const goalTileX = LEVEL.findIndex(t=>t===6);
-    if (goalTileX >= 0) {
-      const goalPx = goalTileX * TILE;
-      if (players.some(p => p.x > goalPx)) {
-        gameState = 'level_end'; stopBGM();
+    // check win condition: last entity with any balloons > 0
+    const alive = entities.filter(e => e.balloons > 0);
+    // If there is only one entity with any balloons -> winner.
+    if (alive.length <= 1) {
+      if (alive.length === 1) {
+        const winner = alive[0];
+        state = 'win';
+        stopBGM();
+        sfxWin();
+        lastWinner = winner;
+      } else {
+        state = 'gameover';
+        stopBGM();
+        sfxFall();
       }
     }
 
-  } // end playing
-}
-
-// PIXEL SCALE helper - convert player size multiples
-function PIX_SCALE(){ return 1; }
-
-// Drawing pixel-art characters using fillRect in 16x16 grid
-function drawPixelSprite(sx, sy, pal, scaleMult=1) {
-  // sx,sy top-left in pixels; pal is array of {x,y,color} in grid coords
-  for (let p of pal) {
-    ctx.fillStyle = p.color;
-    ctx.fillRect(sx + p.x, sy + p.y, p.w || 1, p.h || 1);
+    // simple scoring update on overlay
+    overlayScores.innerHTML = `P1: ${players[0].balloons} 🎈 | P2: ${players[1].balloons} 🎈<br>Score P1:${score.p1} P2:${score.p2}`;
   }
-}
 
-// Define players pixel art 16x16
-function drawPlayers() {
-  for (let p of players) {
-    const drawX = Math.round(p.x - camX / PIX_SCALE());
-    const drawY = Math.round(p.y);
+  // Drawing helpers: pixel art faces
+  function drawPixelArtSprite(ctx, ent) {
+    // We'll draw a side-view sprite ~ 16x20 pixels scaled by PS
+    // Side view facing right if ent.facing > 0 else left
+    const x = Math.round(ent.x);
+    const y = Math.round(ent.y);
+    const scale = 1.6; // visual scale
+    // We'll draw at offset so sprite sits on center bottom.
+    const w = 18, h = 22;
+    const sx = Math.round(x - 8);
+    const sy = Math.round(y - 12);
+
+    // Body shadow/outline
     ctx.save();
-    // If big, scale height
-    const scaleY = p.big ? 1.6 : 1;
-    const px = drawX;
-    const py = drawY - (p.big ? 8 : 0);
-    // Draw simple pixel art using rectangles
-    if (p.isP1) {
-      // TAKESHI: glasses, messy gray hair, stubble, cream shirt w/red apron. Black glasses = two black squares.
-      // hair
-      ctx.fillStyle = '#aaa';
-      ctx.fillRect(px+2, py+0, 12, 4);
-      ctx.fillRect(px+1, py+4, 2, 3);
-      ctx.fillRect(px+13, py+4, 2, 3);
-      // face
-      ctx.fillStyle = '#d8c8b0';
-      ctx.fillRect(px+3, py+4, 10, 6);
-      // glasses
-      ctx.fillStyle = '#111';
-      ctx.fillRect(px+3, py+6, 4, 2);
-      ctx.fillRect(px+9, py+6, 4, 2);
-      // stubble
-      ctx.fillStyle = '#777';
-      ctx.fillRect(px+5, py+9, 6, 1);
-      // body cream shirt
-      ctx.fillStyle = '#f5e6c6';
-      ctx.fillRect(px+2, py+10, 12, 6);
-      // red apron
-      ctx.fillStyle = '#b22';
-      ctx.fillRect(px+5, py+11, 6, 4);
+    ctx.translate(0,0);
+    // Draw body (simple rectangle with cardigan or apron)
+    if (ent.portrait === 'takeshi') {
+      // cream shirt with red apron strap
+      // torso
+      ctx.fillStyle = '#fff3d6';
+      ctx.fillRect(sx+2, sy+10, 12, 8);
+      // apron strap
+      ctx.fillStyle = '#d52a2a';
+      ctx.fillRect(sx+7, sy+10, 2, 8);
+      // neck
+      ctx.fillStyle = '#d9c6b0';
+      ctx.fillRect(sx+6, sy+8, 4, 2);
     } else {
-      // KENJI: bowl cut brown hair, mole, beige cardigan over black shirt.
-      ctx.fillStyle = '#6b4020';
-      ctx.fillRect(px+2, py+0, 12, 5);
-      ctx.fillStyle = '#d8c8b0';
-      ctx.fillRect(px+3, py+5, 10, 6);
-      // mole
-      ctx.fillStyle = '#333';
-      ctx.fillRect(px+10, py+7, 1,1);
-      // cardigan beige
-      ctx.fillStyle = '#d6c8aa';
-      ctx.fillRect(px+2, py+11, 12, 5);
-      // inner black shirt
-      ctx.fillStyle = '#111';
-      ctx.fillRect(px+5, py+11, 6, 2);
+      // Kenji: beige cardigan over black t-shirt
+      ctx.fillStyle = '#e6d5bd';
+      ctx.fillRect(sx+2, sy+10, 12, 8);
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(sx+5, sy+12, 8, 5);
     }
-    // draw eyes as small dots
-    ctx.fillStyle = '#000';
-    ctx.fillRect(px+6, py+7, 1,1);
-    ctx.fillRect(px+9, py+7, 1,1);
-    // invincible glow
-    if (p.star) {
-      ctx.strokeStyle = '#ff0';
-      ctx.globalAlpha = 0.6;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(px, py, 16, 16);
-      ctx.globalAlpha = 1;
+
+    // Face (oval)
+    ctx.fillStyle = '#f3d7c7';
+    ctx.fillRect(sx+4, sy+2, 8, 6);
+    // hair and facial features differ
+    if (ent.portrait === 'takeshi') {
+      // messy salt-and-pepper hair sticking up
+      // use black/gray blocks
+      ctx.fillStyle = '#232527';
+      ctx.fillRect(sx+3, sy+1, 2, 2);
+      ctx.fillRect(sx+5, sy+0, 4, 2);
+      ctx.fillRect(sx+9, sy+1, 2, 2);
+      ctx.fillStyle = '#9aa0a6';
+      ctx.fillRect(sx+5, sy+2, 2, 1);
+      // big black square glasses
+      ctx.fillStyle = '#000';
+      ctx.fillRect(sx+5, sy+3, 3, 2);
+      ctx.fillRect(sx+8, sy+3, 2, 2);
+      // bridge
+      ctx.fillStyle = '#000';
+      ctx.fillRect(sx+8, sy+4, 1, 1);
+      // eyes inside glasses - lighter
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(sx+6, sy+4, 1, 1);
+      ctx.fillRect(sx+9, sy+4, 1, 1);
+      // stubble: dots on chin
+      ctx.fillStyle = '#444';
+      ctx.fillRect(sx+5, sy+7, 1, 1);
+      ctx.fillRect(sx+7, sy+7, 1, 1);
+      ctx.fillRect(sx+9, sy+7, 1, 1);
+    } else {
+      // Kenji
+      // dark brown bowl-cut hair
+      ctx.fillStyle = '#3a2b18';
+      ctx.fillRect(sx+3, sy+0, 10, 3);
+      ctx.fillRect(sx+4, sy+3, 8, 1);
+      // mole on left cheek (viewer right)
+      ctx.fillStyle = '#221717';
+      ctx.fillRect(sx+10, sy+5, 1, 1);
+      // eyes
+      ctx.fillStyle = '#000';
+      ctx.fillRect(sx+6, sy+4, 1, 1);
+      ctx.fillRect(sx+8, sy+4, 1, 1);
     }
+
+    // Arms (side view)
+    ctx.fillStyle = '#f3d7c7';
+    ctx.fillRect(sx+1, sy+12, 3, 3);
+    ctx.fillRect(sx+14, sy+12, 3, 3);
+
+    // Legs
+    ctx.fillStyle = '#2b2b2b';
+    ctx.fillRect(sx+4, sy+18, 3, 3);
+    ctx.fillRect(sx+10, sy+18, 3, 3);
+
+    // Balloons behind the back: two balloons tied to back
+    // let's draw them offset up-left for left-facing and up-right for right-facing
+    const facing = ent.facing >= 0 ? 1 : -1;
+    // determine colors
+    let b1='#f00', b2='#00f';
+    if (ent.portrait === 'takeshi') { b1='#d90000'; b2='#0b66ff'; }
+    else { b1='#74c942'; b2='#f3e85a'; } // Kenji green/yellow
+    if (ent.type === 'enemy') { b1='#ff55aa'; b2='#88ddff'; }
+
+    // If balloon popped, don't draw
+    if (ent.balloons >= 2) {
+      // two balloons
+      ctx.beginPath();
+      ctx.fillStyle = b1;
+      ctx.ellipse(sx + 12 + facing*6, sy + 2, 4,5,0,0,Math.PI*2);
+      ctx.fill();
+      // string
+      ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(sx+8, sy+8); ctx.lineTo(sx+11 + facing*6, sy+6); ctx.stroke();
+      // second
+      ctx.beginPath();
+      ctx.fillStyle = b2;
+      ctx.ellipse(sx + 8 + facing*2, sy + 0, 4,5,0,0,Math.PI*2);
+      ctx.fill();
+      ctx.beginPath(); ctx.moveTo(sx+8, sy+8); ctx.lineTo(sx+8 + facing*2, sy+2); ctx.stroke();
+    } else if (ent.balloons === 1) {
+      // one balloon remaining (draw only one)
+      ctx.beginPath();
+      ctx.fillStyle = b1;
+      ctx.ellipse(sx + 10 + facing*4, sy + 1, 4,5,0,0,Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(sx+8, sy+8); ctx.lineTo(sx+10 + facing*4, sy+3); ctx.stroke();
+    } else {
+      // no balloons: show wounds (small X)
+      ctx.fillStyle = '#ff8080';
+      ctx.fillRect(sx+6, sy+8, 2,1);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(sx+6, sy+9, 4,1);
+    }
+
+    // simple outline
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.strokeRect(sx+2, sy+2, 12, 12);
+
     ctx.restore();
   }
-}
 
-// Draw tile background and level
-function drawLevel() {
-  ctx.fillStyle = '#5ec';
-  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
-  // sky gradient
-  const grad = ctx.createLinearGradient(0,0,0,V_HEIGHT);
-  grad.addColorStop(0,'#87ceeb'); grad.addColorStop(1,'#6ad');
-  ctx.fillStyle = grad; ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
-  // draw ground tiles
-  for (let tx = 0; tx < LEVEL_W; tx++) {
-    const t = LEVEL[tx];
-    const x = tx * TILE - camX;
-    if (x + TILE < 0 || x > V_WIDTH) continue;
-    if (t === 1) {
-      ctx.fillStyle = TILE_COLORS[1];
-      ctx.fillRect(x, V_HEIGHT - TILE*2, TILE, TILE*2);
-      // top soil
-      ctx.fillStyle = '#4b2f12';
-      ctx.fillRect(x, V_HEIGHT - TILE*2, TILE, TILE);
-    } else if (t === 5) {
-      // pipe (two tiles wide)
-      ctx.fillStyle = '#2b7';
-      ctx.fillRect(x, V_HEIGHT - TILE*3, TILE*2, TILE*2);
-      ctx.fillStyle = '#1b5';
-      ctx.fillRect(x, V_HEIGHT - TILE*3, TILE*2, TILE/3);
-      tx+=1; // skip next tile to represent 2-wide
-    } else if (t === 6) {
-      // goal pole
-      ctx.fillStyle = '#222';
-      ctx.fillRect(x + TILE/2, V_HEIGHT - TILE*6, 4, TILE*4);
-      ctx.fillStyle = '#f00';
-      ctx.fillRect(x + TILE/2 + 6, V_HEIGHT - TILE*6 + 4, 8, 8);
-    }
-  }
-  // draw bricks/blocks
-  for (let b of blocks) {
-    const x = (b.x|0) * TILE - camX;
-    let y = 0;
-    if (b.floating) y = (b.y|0) * TILE; else y = V_HEIGHT - TILE*3;
-    if (x+TILE < 0 || x > V_WIDTH) continue;
-    if (b.type === 2) {
-      ctx.fillStyle = TILE_COLORS[2];
-      ctx.fillRect(x, y, TILE, TILE);
-      // little lines
-      ctx.strokeStyle = '#7b2000';
-      ctx.strokeRect(x, y, TILE, TILE);
-    } else if (b.type === 3) {
-      ctx.fillStyle = TILE_COLORS[3];
-      ctx.fillRect(x, y, TILE, TILE);
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(x+6, y+6, 4, 4);
-    }
-  }
-  // draw coins
-  for (let c of coins) {
-    if (c.collected) continue;
-    const cx = c.x * TILE - camX;
-    const cy = c.y * TILE;
-    if (cx < -10 || cx > V_WIDTH+10) continue;
-    ctx.fillStyle = '#ffdc55';
+  // draw clouds/platform
+  function drawPlatform(p) {
+    // cloud with soft edges: draw white ellipse rectangles
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    // base
+    roundRect(ctx, p.x, p.y, p.w, p.h, 6, true, false);
+    // puffs
     ctx.beginPath();
-    ctx.ellipse(cx+6, cy+6, 4, 4, 0,0,Math.PI*2);
+    ctx.ellipse(p.x+8, p.y+4, 10,6, 0,0,Math.PI*2);
     ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(p.x + p.w - 10, p.y+4, 10,6,0,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
   }
-  // draw enemies
-  for (let e of enemies) {
-    const ex = e.x * TILE - camX;
-    const ey = e.y * TILE;
-    if (ex < -20 || ex > V_WIDTH+20) continue;
-    if (e.type === 'goomba') {
-      ctx.fillStyle = '#a55';
-      ctx.fillRect(ex+2, ey+2, 12, 12);
-      ctx.fillStyle = '#000'; ctx.fillRect(ex+4, ey+4, 2,2); ctx.fillRect(ex+10, ey+4,2,2);
-    } else if (e.type === 'koopa') {
-      ctx.fillStyle = '#3a8';
-      ctx.fillRect(ex+2, ey+2, 12, 12);
-      ctx.fillStyle = '#000'; ctx.fillRect(ex+6, ey+7, 4,4);
-    } else if (e.type === 'fly') {
-      ctx.fillStyle = '#f9a';
-      ctx.fillRect(ex+2, ey+2, 12, 8);
-      ctx.fillStyle = '#000'; ctx.fillRect(ex+5, ey+4, 2,2);
-    }
+
+  function roundRect(ctx, x, y, w, h, r, fill, stroke) {
+    if (r===undefined) r=5;
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+    if (fill) ctx.fill();
+    if (stroke) ctx.stroke();
   }
-}
 
-// Draw HUD: score, time, lives, coins
-function drawHUD() {
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(6,6, V_WIDTH-12, 28);
-  ctx.fillStyle = '#fff';
-  ctx.font = '10px monospace';
-  ctx.fillText('TITLE: スーパーTANABEブラザーズ', 12, 16);
-  ctx.fillText('TIME: ' + Math.floor(HUD.time), 12, 28);
-  ctx.fillText('COINS: ' + HUD.coins, 120, 28);
-  // players info on top right
-  ctx.fillStyle = '#fff';
-  ctx.fillText(players[0].name + ' S:' + players[0].lives, V_WIDTH - 150, 16);
-  ctx.fillText(players[1].name + ' S:' + players[1].lives, V_WIDTH - 150, 28);
-}
+  let lastWinner = null;
+  // Render loop
+  function render(t) {
+    if (!lastTimestamp) lastTimestamp = t;
+    const dt = t - lastTimestamp;
+    lastTimestamp = t;
 
-// Title and menus
-function drawTitle() {
-  // background
-  ctx.fillStyle = '#3aa';
-  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
-  // big Japanese logo text (pixel-style)
-  ctx.fillStyle = '#fff';
-  ctx.font = '20px monospace';
-  ctx.fillText('スーパーTANABEブラザーズ', 28, 60);
-  ctx.font = '10px monospace';
-  ctx.fillText('Press Enter to Start', 110 + Math.sin(titleTick/300)*6, 120);
-  ctx.fillText('P1: WASD (W jump)  P2: Arrow Keys (Up jump)', 50, 140);
-  ctx.fillText('Mobile: Left tap=P1 jump, Right tap=P2 jump', 24, 152);
-  // draw tiny characters
-  ctx.save();
-  ctx.translate(80,80);
-  // P1 sprite
-  ctx.fillStyle = '#aaa'; ctx.fillRect(0,0,24,24);
-  ctx.fillStyle = '#6b4020'; ctx.fillRect(32,0,24,24);
-  ctx.restore();
-}
+    update(dt);
 
-// Gameover screen
-function drawGameOver() {
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
-  ctx.fillStyle = '#fff';
-  ctx.font = '18px monospace';
-  ctx.fillText('GAME OVER', 110, 80);
-  ctx.font = '10px monospace';
-  ctx.fillText('Press Enter to go to Title', 90, 110);
-}
+    // clear
+    ctx.clearRect(0,0,W,H);
+    // background gradient sky and distant clouds
+    // ground sliver
+    ctx.fillStyle = '#bfefff';
+    ctx.fillRect(0, H-10, W, 10);
 
-function loop(now) {
-  const dt = Math.min(1000/30, now - lastTime);
-  lastTime = now;
-  acc += dt;
-  // Run update at fixed steps
-  while (acc >= 1000/FPS) {
-    update(1000/FPS);
-    acc -= 1000/FPS;
-  }
-  // render
-  render();
-  requestAnimationFrame(loop);
-}
+    // draw platforms
+    for (let p of platforms) drawPlatform(p);
 
-function render() {
-  // clear
-  ctx.fillStyle = '#6ad';
-  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
+    // draw hazards: flashing lightning on sides
+    if (hazards.left) drawLightning(8, 30, true);
+    if (hazards.right) drawLightning(W-8, 30, false);
 
-  if (gameState === 'title') {
-    drawTitle();
-  } else if (gameState === 'playing') {
-    drawLevel();
-    drawPlayers();
-    drawHUD();
-  } else if (gameState === 'level_end') {
-    // show level clear screen
-    drawLevel();
-    drawPlayers();
-    ctx.fillStyle = 'rgba(0,0,0,0.5)';
-    ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
-    ctx.fillStyle = '#fff';
-    ctx.font = '16px monospace';
-    ctx.fillText('LEVEL CLEARED!', 100, 90);
-    ctx.font = '10px monospace';
-    ctx.fillText('Press Enter to Restart', 100, 110);
-  } else if (gameState === 'gameover') {
-    drawGameOver();
-  }
-}
+    // draw entities sorted by y (so those lower appear in front)
+    const sorted = [...entities].sort((a,b)=>a.y - b.y);
+    for (let ent of sorted) {
+      // shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.12)';
+      ctx.beginPath();
+      ctx.ellipse(ent.x, ent.y + ent.radius + 6, ent.radius+4, 3, 0, 0, Math.PI*2);
+      ctx.fill();
 
-// Kick off loop
-requestAnimationFrame(loop);
+      // draw character pixel sprite
+      drawPixelArtSprite(ctx, ent);
 
-// Allow Enter on title/level_end/gameover to start/restart
-window.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    if (gameState === 'title' || gameState === 'gameover') startGame();
-    else if (gameState === 'level_end') startGame();
-  }
-});
+      // balloon count indicator above head
+      ctx.fillStyle = '#222';
+      ctx.font = '8px monospace';
+      ctx.fillText(`${ent.name} ${ent.balloons}🎈`, ent.x - 20, ent.y - 18);
 
-// Small additional polish: allow manual coin spawn by hitting blocks with jump - simplified simulation
-// Check jumping and blocks: when player's head intersects a ? block tile above ground-level blocks, release coin/mushroom/star
-setInterval(()=> {
-  if (gameState !== 'playing') return;
-  for (let p of players) {
-    if (p.vy < -1) {
-      // check for blocks near player's head
-      for (let b of blocks) {
-        // compute block pixel pos
-        const bx = (b.x|0)*TILE;
-        let by = b.floating ? (b.y|0)*TILE : V_HEIGHT - TILE*3;
-        if (p.x + p.widthPixels > bx && p.x < bx + TILE && Math.abs((p.y) - (by + TILE)) < 6) {
-          // hit block from below
-          if (b.type === 3 && !b.used) {
-            b.used = true;
-            if (b.content === 'coin') { HUD.coins++; HUD.score += 200; sfx('coin'); }
-            else if (b.content === 'mushroom') {
-              // spawn a mushroom that moves right
-              projectiles.push({type:'mushroom', x:bx+TILE, y:by, vx:0.6});
-              sfx('power');
-            } else if (b.content === 'star') {
-              projectiles.push({type:'star', x:bx+TILE, y:by, vx:0.6});
-            }
-          } else if (b.type === 2) {
-            // brick: if player big and hits, break
-            if (p.big) {
-              // destroy brick
-              const idx = blocks.indexOf(b);
-              if (idx>=0) blocks.splice(idx,1);
-              sfx('stomp'); HUD.score += 50;
-            } else {
-              // bump
-              sfx('stomp');
-            }
-          }
-        }
+      // invulnerability flash overlay
+      if (ent.invuln > 0 && Math.floor(ent.invuln/4) % 2 === 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.25)';
+        ctx.beginPath();
+        ctx.arc(ent.x, ent.y-2, ent.radius+4,0,Math.PI*2);
+        ctx.fill();
       }
     }
-  }
-}, 120);
 
-// Update projectiles (mushroom/star)
-setInterval(()=> {
-  if (gameState !== 'playing') return;
-  const toRemove = [];
-  for (let pr of projectiles) {
-    pr.x += pr.vx;
-    // pick up by players?
-    for (let p of players) {
-      const px = p.x; const py = p.y;
-      const prPx = pr.x; const prPy = pr.y;
-      if (Math.abs((px+8) - prPx) < 12 && Math.abs((py+8) - prPy) < 12) {
-        if (pr.type === 'mushroom') { p.big = true; p.bigTimer=12; HUD.score += 500; sfx('power'); }
-        else if (pr.type === 'star') { p.star = true; p.starTimer=8; HUD.score += 800; sfx('power'); }
-        toRemove.push(pr);
-      }
+    // UI: title and subtitle if state=title
+    if (state === 'title') {
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(16,30, W-32, 160);
+      ctx.fillStyle = '#fff';
+      ctx.font = '12px sans-serif';
+      ctx.fillText('スーパーTANABEブラザーズ', 40, 64);
+      ctx.font = '11px sans-serif';
+      ctx.fillText('〜バルーンファイト〜', 52, 82);
+      ctx.font = '9px monospace';
+      ctx.fillText('1P: WASD (W=flap). 2P: Arrows (↑=flap). Touch: left=P1 right=P2', 28, 110);
+      ctx.fillText('Goal: Pop balloons. Last one with a balloon wins!', 28, 126);
+      ctx.fillText('Click / Press ENTER to START', 52, 152);
+      // draw small sprites for both heroes
+      drawPixelArtSprite(ctx, {x:80,y:150,portrait:'takeshi',balloons:2,facing:1,name:'TAKESHI'});
+      drawPixelArtSprite(ctx, {x:176,y:150,portrait:'kenji',balloons:2,facing:-1,name:'KENJI'});
     }
-    // if out of bounds remove
-    if (pr.x < 0 || pr.x > LEVEL_W * TILE) toRemove.push(pr);
-  }
-  for (let r of toRemove) { const i = projectiles.indexOf(r); if (i>=0) projectiles.splice(i,1); }
-}, 1000/30);
 
-// Draw projectiles in render stage by injecting into drawLevel function area? For simplicity, attach to loop via below hook:
-(function drawOverlayLoop(){
-  requestAnimationFrame(drawOverlayLoop);
-  if (gameState !== 'playing') return;
-  // draw projectiles on top
-  for (let pr of projectiles) {
-    const x = pr.x - camX;
-    const y = pr.y;
-    if (x < -10 || x > V_WIDTH+10) continue;
-    if (pr.type === 'mushroom') {
-      ctx.fillStyle = '#f55'; ctx.fillRect(x+2, y+2, 12, 12);
-    } else if (pr.type === 'star') {
-      ctx.fillStyle = '#ff0'; ctx.fillRect(x+2, y+2, 12, 12);
+    if (state === 'win') {
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(16,30, W-32, 160);
+      ctx.fillStyle = '#fff';
+      ctx.font = '14px sans-serif';
+      let label = lastWinner ? (lastWinner.type==='player' ? `${lastWinner.name} WINS!` : `ENEMY WINS!`) : 'YOU WIN!';
+      ctx.fillText(label, 60, 80);
+      ctx.font = '10px sans-serif';
+      ctx.fillText('Press ENTER or Click to go to title', 48, 120);
+      ctx.fillText(`Score P1:${score.p1}  P2:${score.p2}`, 80, 140);
     }
+
+    if (state === 'gameover') {
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(16,30, W-32, 160);
+      ctx.fillStyle = '#fff';
+      ctx.font = '14px sans-serif';
+      ctx.fillText('GAME OVER', 80, 80);
+      ctx.font = '10px sans-serif';
+      ctx.fillText('No balloons left. Press ENTER or Click to return to title', 22, 120);
+    }
+
+    requestAnimationFrame(render);
   }
+
+  // draw lightning bolt
+  function drawLightning(x,y, left) {
+    ctx.save();
+    ctx.translate(0,0);
+    ctx.strokeStyle = 'rgba(255,255,120,0.95)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (left) {
+      ctx.moveTo(16,8); ctx.lineTo(6,30); ctx.lineTo(18,32); ctx.lineTo(8,56);
+    } else {
+      ctx.moveTo(W-16,8); ctx.lineTo(W-6,30); ctx.lineTo(W-18,32); ctx.lineTo(W-8,56);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Start title screen first
+  state = 'title';
+  touchHint.textContent = 'Touch to flap: Left=P1 Right=P2';
+
+  // Kick off the loop
+  requestAnimationFrame(render);
+
+  // Expose some debug controls on console (optional)
+  window._game = {
+    startBGM, stopBGM, resetGame, entities, platforms
+  };
+
 })();
-
-// small helper: when clicking canvas, resume audio
-canvas.addEventListener('pointerdown', ()=> { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
-
-// Instructions drawing to ensure visible on small screens
-// End of file
 </script>
 </body>
 </html>
