@@ -1,0 +1,819 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>スーパーTANABEブラザーズ</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b3b62;display:flex;align-items:center;justify-content:center;font-family:monospace}
+  canvas{image-rendering:pixelated;border:8px solid #111; background:#6ad}
+  .overlay{position:fixed;left:8px;top:8px;color:#fff;font-size:12px}
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+/*
+  スーパーTANABEブラザーズ
+  Single-file HTML5 Canvas game with 2-player local co-op.
+  Controls: P1 WASD (W jump), P2 Arrow keys (Up jump)
+  Mobile: left half tap = P1 jump, right half tap = P2 jump
+*/
+
+// Basic settings
+const TILE = 16;                     // tile pixel size in source
+const V_WIDTH = 320;                 // virtual canvas width
+const V_HEIGHT = 192;                // virtual canvas height
+const LEVEL_TILES = 200;             // level width in tiles
+const GRAVITY = 0.6;
+const MAX_FALL = 12;
+const FPS = 60;
+
+// Canvas setup
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d', { alpha: false });
+let scale = 2;
+function resize() {
+  const availW = window.innerWidth - 40;
+  const availH = window.innerHeight - 40;
+  scale = Math.floor(Math.min(availW / V_WIDTH, availH / V_HEIGHT));
+  if (scale < 1) scale = 1;
+  canvas.width = V_WIDTH * scale;
+  canvas.height = V_HEIGHT * scale;
+  canvas.style.width = (V_WIDTH * scale) + 'px';
+  canvas.style.height = (V_HEIGHT * scale) + 'px';
+  ctx.setTransform(scale,0,0,scale,0,0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Game state
+let gameState = 'title'; // title, playing, level_end, gameover
+let titleTick = 0;
+let lastTime = performance.now();
+let acc = 0;
+
+// Camera
+let camX = 0;
+
+// Level: array of tile codes. 0 empty,1 ground,2 brick,3 question,4 coin tile (visual),5 pipe,6 goal pole base
+const LEVEL_W = LEVEL_TILES;
+const LEVEL = new Array(LEVEL_W).fill(0);
+const TILE_COLORS = {
+  1: '#5d3b1b', // ground
+  2: '#b73b3b', // brick
+  3: '#dcae3a', // ?
+  4: '#ffd24a', // coin tile
+  5: '#3aa',    // pipe
+  6: '#222'
+};
+
+// Entities arrays
+let coins = [];
+let blocks = [];
+let enemies = [];
+let particles = [];
+let projectiles = [];
+let HUD = { time: 400, score: 0, coins: 0 };
+
+// Players
+class Player {
+  constructor(x,y, config) {
+    this.x = x; this.y = y;
+    this.w = 12; this.h = 16;
+    this.vx = 0; this.vy = 0;
+    this.onGround = false;
+    this.facing = 1;
+    this.name = config.name;
+    this.isP1 = config.isP1;
+    this.color = config.color;
+    this.lives = 3;
+    this.coins = 0;
+    this.score = 0;
+    this.big = false;
+    this.bigTimer = 0;
+    this.star = false;
+    this.starTimer = 0;
+    this.canDouble = config.canDouble; // Takeshi double jump
+    this.jumps = 0;
+    this.speed = config.speed || 1.2;
+    this.jumpPower = config.jumpPower || -9;
+    this.wallKick = config.wallKick || false;
+    this.widthPixels = 12;
+    this.heightPixels = 16;
+    this.dead = false;
+  }
+  reset(x,y) {
+    this.x = x; this.y = y; this.vx=0; this.vy=0; this.onGround=false; this.jumps=0; this.dead=false;
+    this.big = false; this.bigTimer = 0; this.star=false; this.starTimer=0;
+  }
+}
+const players = [
+  new Player(40, 50, { name:'兄 TAKESHI', isP1:true, color:'#111', canDouble:true, speed:1.6, jumpPower:-8 }),
+  new Player(60, 50, { name:'弟 KENJI', isP1:false, color:'#8b5', canDouble:false, speed:1.2, jumpPower:-11, wallKick:true })
+];
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if(gameState==='title' && e.key==='Enter') startGame(); if(e.key==='Escape') gameState='title';});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+// Touch controls: left half tap -> P1 jump, right half -> P2 jump
+window.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (let t of e.touches) {
+    if (t.clientX < window.innerWidth/2) playerJump(players[0]);
+    else playerJump(players[1]);
+  }
+}, {passive:false});
+
+// Simple audio - 8-bit BGM and sound effects
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+const audioCtx = AudioCtx ? new AudioCtx() : null;
+let bgmGain, bgmOsc;
+function startBGM() {
+  if (!audioCtx) return;
+  if (bgmOsc) stopBGM();
+  bgmGain = audioCtx.createGain();
+  bgmGain.gain.value = 0.18;
+  bgmGain.connect(audioCtx.destination);
+  let t = audioCtx.currentTime;
+  // simple sequence using oscillator scheduling
+  bgmOsc = audioCtx.createOscillator();
+  bgmOsc.type = 'square';
+  bgmOsc.frequency.setValueAtTime(220, t);
+  bgmOsc.connect(bgmGain);
+  bgmOsc.start();
+  // modulate freq to make a chiptune-like loop
+  let seq = [392, 440, 494, 523, 440, 392, 349, 330];
+  let i=0;
+  const loop = () => {
+    if (!bgmOsc) return;
+    bgmOsc.frequency.setValueAtTime(seq[i%seq.length], audioCtx.currentTime);
+    i++;
+    setTimeout(loop, 180);
+  };
+  loop();
+}
+function stopBGM() {
+  if (!audioCtx) return;
+  try { bgmOsc.stop(); } catch(e){}
+  bgmOsc = null;
+  bgmGain = null;
+}
+function sfx(type) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const g = audioCtx.createGain();
+  g.gain.value = 0.12;
+  g.connect(audioCtx.destination);
+  const o = audioCtx.createOscillator();
+  o.type = 'square';
+  switch(type) {
+    case 'jump': o.frequency.setValueAtTime(880, t); g.gain.linearRampToValueAtTime(0.02,t+0.3); break;
+    case 'coin': o.frequency.setValueAtTime(1320, t); g.gain.linearRampToValueAtTime(0.02,t+0.2); break;
+    case 'power': o.frequency.setValueAtTime(660, t); g.gain.linearRampToValueAtTime(0.02,t+0.7); break;
+    case 'stomp': o.frequency.setValueAtTime(220, t); g.gain.linearRampToValueAtTime(0.02,t+0.25); break;
+    case 'die': o.frequency.setValueAtTime(110, t); g.gain.linearRampToValueAtTime(0.02,t+0.6); break;
+    default: o.frequency.setValueAtTime(440, t); g.gain.linearRampToValueAtTime(0.02,t+0.2);
+  }
+  o.connect(g);
+  o.start();
+  o.stop(t + 0.25 + Math.random()*0.4);
+}
+
+// Helper functions
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function randInt(a,b){return Math.floor(Math.random()*(b-a+1))+a;}
+
+// Build procedural-ish level
+function buildLevel() {
+  for (let i=0;i<LEVEL_W;i++) LEVEL[i]=0;
+  const groundY = Math.floor(V_HEIGHT / TILE) - 2; // two tiles from bottom
+  // flat start
+  for (let i=0;i<10;i++) LEVEL[i] = 1;
+  // ground across
+  for (let x=0;x<LEVEL_W;x++) {
+    if (x<10) continue;
+    // create occasional gaps
+    if (x>20 && Math.random()<0.04 && x<LEVEL_W-20) {
+      // gap of 1-3
+      const gap = randInt(1,3);
+      for (let g=0;g<gap;g++) LEVEL[x+g]=0;
+      x += gap-1;
+      continue;
+    }
+    // pipe
+    if (Math.random()<0.03 && x<LEVEL_W-6) {
+      LEVEL[x] = 5; LEVEL[x+1]=0; LEVEL[x+2]=1;
+      x+=2; continue;
+    }
+    // place some bricks and ? blocks
+    if (Math.random()<0.12) {
+      LEVEL[x] = 1;
+      if (Math.random()<0.6 && x<LEVEL_W-2) {
+        LEVEL[x] = 1;
+        blocks.push({x:x, type: 2}); // brick above ground
+        // represent a brick at tile above ground. We'll track it separately
+      } else if (Math.random()<0.3) {
+        blocks.push({x:x, type:3, content: (Math.random()<0.6?'coin': (Math.random()<0.5?'mushroom':'star')), used:false});
+      }
+    } else {
+      LEVEL[x] = 1;
+    }
+    // random small hill: set ground tile to 1 but we can add floating platforms later
+  }
+  // Goal pole near end
+  const goalX = LEVEL_W - 10;
+  LEVEL[goalX] = 6;
+  // Add floating coins and platforms
+  for (let i=20;i<LEVEL_W-20;i+=10) {
+    if (Math.random()<0.6) {
+      const height = randInt(3,6);
+      // create 3 tile wide floating platform
+      for (let w=0;w<3;w++) {
+        blocks.push({x:i+w, y:height, type:2, floating:true});
+      }
+      if (Math.random()<0.6) {
+        // coins above
+        for (let c=0;c<3;c++) coins.push({x:i+c+0.5, y:height-1.5, collected:false});
+      }
+    }
+  }
+  // spawn some enemies
+  for (let i=15;i<LEVEL_W-15;i+=8) {
+    if (Math.random()<0.4) enemies.push({type:'goomba', x:i*1.0+0.5, y:groundY-1, vx: (Math.random()<0.5?-0.4:0.4), dead:false});
+    else if (Math.random()<0.2) enemies.push({type:'koopa', x:i*1.0+0.5, y:groundY-1, vx: (Math.random()<0.5?-0.25:0.25), dead:false});
+    if (Math.random()<0.12) enemies.push({type:'fly', x:i*1.0+0.5, y:groundY-4, vx: (Math.random()<0.5?-0.3:0.3), sinOff: Math.random()*10, dead:false});
+  }
+}
+
+buildLevel();
+
+// Utility collision with tiles
+function tileAt(tx) {
+  if (tx < 0 || tx >= LEVEL_W) return 0;
+  return LEVEL[tx] || 0;
+}
+
+// Brick/block state map keyed by x and y for floating platforms
+let brickMap = {};
+function rebuildBrickMap() {
+  brickMap = {};
+  for (let b of blocks) {
+    const key = (b.x|0) + ',' + ((b.y !== undefined) ? (b.y|0) : ('ground'));
+    brickMap[key] = Object.assign({}, b);
+  }
+}
+rebuildBrickMap();
+
+// Spawn a coin
+function spawnCoin(x,y) {
+  coins.push({x:x, y:y, collected:false, vy:-2, tick:0});
+}
+
+// Player actions
+function playerJump(p) {
+  if (p.dead) return;
+  if (p.onGround) {
+    p.vy = p.jumpPower;
+    p.onGround = false;
+    p.jumps = 1;
+    sfx('jump');
+  } else {
+    // double jump for Takeshi
+    if (p.canDouble && p.jumps < 2) {
+      p.vy = p.jumpPower * 0.85;
+      p.jumps++;
+      sfx('jump');
+    } else if (p.wallKick) {
+      // wall kick: if touching wall horizontally and in air, bounce off
+      const leftTile = tileAt(Math.floor((p.x-1)/1));
+      const rightTile = tileAt(Math.floor((p.x+1)/1));
+      // we do a simpler check using x position against camera boundaries: if near a tile that is solid
+      // Check wall tiles near player's tile position
+      const tileX = Math.floor(p.x/1);
+      if (tileAt(tileX-1) === 1) { p.vx = 3; p.vy = p.jumpPower; sfx('jump'); }
+      else if (tileAt(tileX+1) === 1) { p.vx = -3; p.vy = p.jumpPower; sfx('jump'); }
+    }
+  }
+}
+
+// Main loop
+function startGame() {
+  // reset everything
+  coins = []; blocks = []; enemies = []; particles = [];
+  HUD = { time: 400, score: 0, coins: 0 };
+  buildLevel();
+  blocks.push({x:12, type:3, content:'mushroom', used:false});
+  rebuildBrickMap();
+  players[0].reset(40,50);
+  players[1].reset(60,50);
+  players[0].lives = 3; players[1].lives = 3;
+  gameState = 'playing';
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  startBGM();
+}
+function gameOver() {
+  stopBGM();
+  gameState = 'gameover';
+}
+
+// Game update
+function update(dt) {
+  titleTick += dt;
+  if (gameState === 'playing') {
+    HUD.time -= dt/1000;
+    if (HUD.time <= 0) {
+      // Time up => lose life for both?
+      for (let p of players) p.lives = Math.max(0, p.lives-1);
+      HUD.time = 0;
+      sfx('die');
+      // check gameover
+      if (players.every(p=>p.lives<=0)) gameOver();
+    }
+    // Input for players
+    // Player 1 WASD
+    const p1 = players[0], p2 = players[1];
+    // Horizontal move
+    if (keys['a']) { p1.vx = -p1.speed; p1.facing = -1; } else if (keys['d']) { p1.vx = p1.speed; p1.facing = 1; } else { p1.vx *= 0.8; if (Math.abs(p1.vx)<0.01) p1.vx=0; }
+    if (keys['w'] && !p1._wPrev) { playerJump(p1); } p1._wPrev = keys['w'];
+    // Player 2 arrows
+    if (keys['arrowleft']) { p2.vx = -p2.speed; p2.facing = -1; } else if (keys['arrowright']) { p2.vx = p2.speed; p2.facing = 1; } else { p2.vx *= 0.8; if (Math.abs(p2.vx)<0.01) p2.vx=0; }
+    if (keys['arrowup'] && !p2._upPrev) { playerJump(p2); } p2._upPrev = keys['arrowup'];
+
+    // update players physics
+    for (let p of players) {
+      if (p.dead) continue;
+      p.vy += GRAVITY;
+      p.vy = clamp(p.vy, -999, MAX_FALL);
+      // move horizontally in small steps for collision
+      let nx = p.x + p.vx;
+      let ny = p.y + p.vy;
+      // convert to tile coords
+      // ground is at bottom tiles of LEVEL: we assume ground tiles exist at y = groundY...
+      const maxYTile = Math.floor(V_HEIGHT / TILE) - 2;
+      // Horizontal collision with tiles based on simple ground and pipes
+      // Check tile under player's feet for platform detection
+      p.onGround = false;
+      // approximate player's tile coordinate
+      const tileBelow = Math.floor((p.y + p.h/PIX_SCALE())/TILE);
+      // Actually simpler: treat floor at bottom if y+height exceeds certain pixel pos
+      const floorY = V_HEIGHT - TILE*2;
+      if (p.y + p.h >= floorY) {
+        p.y = floorY - p.h;
+        p.vy = 0;
+        p.onGround = true;
+        p.jumps = 0;
+      } else {
+        p.y = ny;
+      }
+      p.x = nx;
+      // Collect coins (tileless) and collisions with enemies
+      // coin collisions
+      for (let c of coins) {
+        if (c.collected) continue;
+        if (Math.abs((p.x+6) - (c.x*TILE)) < 12 && Math.abs((p.y+8) - (c.y*TILE)) < 12) {
+          c.collected = true; HUD.coins++; HUD.score += 200; sfx('coin');
+        }
+      }
+      // Block hit from below (simulate hitting blocks when jumping)
+      // If player moving up and intersects any block above: check blocks array for bricks at tile above player's head position
+      if (p.vy < 0) {
+        // find blocks with x matching
+        for (let b of blocks) {
+          const bx = (b.x|0)*TILE;
+          const by = ((b.y !== undefined)? b.y : 0);
+        }
+      }
+      // Big mode timer
+      if (p.big) {
+        p.bigTimer -= dt/1000;
+        if (p.bigTimer <= 0) { p.big = false; sfx('die'); }
+      }
+      if (p.star) {
+        p.starTimer -= dt/1000;
+        if (p.starTimer <= 0) { p.star = false; sfx('die'); }
+      }
+    }
+
+    // Simpler tile interactions: we'll detect collisions with ground tiles for enemies and limited brick interactions when jumping into ? blocks.
+    // Process enemy motion and collisions with players
+    for (let e of enemies) {
+      if (e.dead) continue;
+      if (e.type === 'fly') {
+        e.x += e.vx;
+        e.y += Math.sin((performance.now()/200)+e.sinOff)*0.03 + 0.02;
+      } else {
+        e.x += e.vx;
+      }
+      // basic ground collision: keep at ground
+      const groundY = Math.floor(V_HEIGHT / TILE) - 3;
+      e.y = Math.max(e.y, groundY);
+      // wrap or die at edges
+      if (e.x < 0 || e.x > LEVEL_W) e.dead = true;
+    }
+    // Remove dead enemies occasionally
+    enemies = enemies.filter(e => !e.dead);
+
+    // Check player-enemy interactions
+    for (let p of players) {
+      if (p.dead) continue;
+      for (let e of enemies) {
+        if (e.dead) continue;
+        const dx = (p.x + p.widthPixels/2) - (e.x * TILE + TILE/2);
+        const dy = (p.y + p.heightPixels/2) - (e.y * TILE + TILE/2);
+        if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+          if (p.vy > 0 && dy < 6) {
+            // player stomps enemy
+            e.dead = true;
+            sfx('stomp');
+            p.vy = -6;
+            HUD.score += 100;
+          } else if (p.star) {
+            e.dead = true; HUD.score += 200; sfx('stomp');
+          } else {
+            // player hurt
+            p.lives--; sfx('die');
+            p.dead = true;
+            setTimeout(()=>{ p.reset(40 + (p.isP1?0:20), 50); }, 1000);
+            if (players.every(pl=>pl.lives<=0)) gameOver();
+          }
+        }
+      }
+    }
+
+    // Update coins animation
+    for (let c of coins) {
+      if (c.collected) continue;
+      c.tick += dt/1000;
+      c.y += c.vy;
+      c.vy += GRAVITY*0.2;
+    }
+    // Camera follow both players: center between players
+    const avgX = (players[0].x + players[1].x) / 2;
+    camX = clamp(avgX - V_WIDTH/2, 0, LEVEL_W * TILE - V_WIDTH);
+
+    // Goal detection
+    const goalTileX = LEVEL.findIndex(t=>t===6);
+    if (goalTileX >= 0) {
+      const goalPx = goalTileX * TILE;
+      if (players.some(p => p.x > goalPx)) {
+        gameState = 'level_end'; stopBGM();
+      }
+    }
+
+  } // end playing
+}
+
+// PIXEL SCALE helper - convert player size multiples
+function PIX_SCALE(){ return 1; }
+
+// Drawing pixel-art characters using fillRect in 16x16 grid
+function drawPixelSprite(sx, sy, pal, scaleMult=1) {
+  // sx,sy top-left in pixels; pal is array of {x,y,color} in grid coords
+  for (let p of pal) {
+    ctx.fillStyle = p.color;
+    ctx.fillRect(sx + p.x, sy + p.y, p.w || 1, p.h || 1);
+  }
+}
+
+// Define players pixel art 16x16
+function drawPlayers() {
+  for (let p of players) {
+    const drawX = Math.round(p.x - camX / PIX_SCALE());
+    const drawY = Math.round(p.y);
+    ctx.save();
+    // If big, scale height
+    const scaleY = p.big ? 1.6 : 1;
+    const px = drawX;
+    const py = drawY - (p.big ? 8 : 0);
+    // Draw simple pixel art using rectangles
+    if (p.isP1) {
+      // TAKESHI: glasses, messy gray hair, stubble, cream shirt w/red apron. Black glasses = two black squares.
+      // hair
+      ctx.fillStyle = '#aaa';
+      ctx.fillRect(px+2, py+0, 12, 4);
+      ctx.fillRect(px+1, py+4, 2, 3);
+      ctx.fillRect(px+13, py+4, 2, 3);
+      // face
+      ctx.fillStyle = '#d8c8b0';
+      ctx.fillRect(px+3, py+4, 10, 6);
+      // glasses
+      ctx.fillStyle = '#111';
+      ctx.fillRect(px+3, py+6, 4, 2);
+      ctx.fillRect(px+9, py+6, 4, 2);
+      // stubble
+      ctx.fillStyle = '#777';
+      ctx.fillRect(px+5, py+9, 6, 1);
+      // body cream shirt
+      ctx.fillStyle = '#f5e6c6';
+      ctx.fillRect(px+2, py+10, 12, 6);
+      // red apron
+      ctx.fillStyle = '#b22';
+      ctx.fillRect(px+5, py+11, 6, 4);
+    } else {
+      // KENJI: bowl cut brown hair, mole, beige cardigan over black shirt.
+      ctx.fillStyle = '#6b4020';
+      ctx.fillRect(px+2, py+0, 12, 5);
+      ctx.fillStyle = '#d8c8b0';
+      ctx.fillRect(px+3, py+5, 10, 6);
+      // mole
+      ctx.fillStyle = '#333';
+      ctx.fillRect(px+10, py+7, 1,1);
+      // cardigan beige
+      ctx.fillStyle = '#d6c8aa';
+      ctx.fillRect(px+2, py+11, 12, 5);
+      // inner black shirt
+      ctx.fillStyle = '#111';
+      ctx.fillRect(px+5, py+11, 6, 2);
+    }
+    // draw eyes as small dots
+    ctx.fillStyle = '#000';
+    ctx.fillRect(px+6, py+7, 1,1);
+    ctx.fillRect(px+9, py+7, 1,1);
+    // invincible glow
+    if (p.star) {
+      ctx.strokeStyle = '#ff0';
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px, py, 16, 16);
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+}
+
+// Draw tile background and level
+function drawLevel() {
+  ctx.fillStyle = '#5ec';
+  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
+  // sky gradient
+  const grad = ctx.createLinearGradient(0,0,0,V_HEIGHT);
+  grad.addColorStop(0,'#87ceeb'); grad.addColorStop(1,'#6ad');
+  ctx.fillStyle = grad; ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
+  // draw ground tiles
+  for (let tx = 0; tx < LEVEL_W; tx++) {
+    const t = LEVEL[tx];
+    const x = tx * TILE - camX;
+    if (x + TILE < 0 || x > V_WIDTH) continue;
+    if (t === 1) {
+      ctx.fillStyle = TILE_COLORS[1];
+      ctx.fillRect(x, V_HEIGHT - TILE*2, TILE, TILE*2);
+      // top soil
+      ctx.fillStyle = '#4b2f12';
+      ctx.fillRect(x, V_HEIGHT - TILE*2, TILE, TILE);
+    } else if (t === 5) {
+      // pipe (two tiles wide)
+      ctx.fillStyle = '#2b7';
+      ctx.fillRect(x, V_HEIGHT - TILE*3, TILE*2, TILE*2);
+      ctx.fillStyle = '#1b5';
+      ctx.fillRect(x, V_HEIGHT - TILE*3, TILE*2, TILE/3);
+      tx+=1; // skip next tile to represent 2-wide
+    } else if (t === 6) {
+      // goal pole
+      ctx.fillStyle = '#222';
+      ctx.fillRect(x + TILE/2, V_HEIGHT - TILE*6, 4, TILE*4);
+      ctx.fillStyle = '#f00';
+      ctx.fillRect(x + TILE/2 + 6, V_HEIGHT - TILE*6 + 4, 8, 8);
+    }
+  }
+  // draw bricks/blocks
+  for (let b of blocks) {
+    const x = (b.x|0) * TILE - camX;
+    let y = 0;
+    if (b.floating) y = (b.y|0) * TILE; else y = V_HEIGHT - TILE*3;
+    if (x+TILE < 0 || x > V_WIDTH) continue;
+    if (b.type === 2) {
+      ctx.fillStyle = TILE_COLORS[2];
+      ctx.fillRect(x, y, TILE, TILE);
+      // little lines
+      ctx.strokeStyle = '#7b2000';
+      ctx.strokeRect(x, y, TILE, TILE);
+    } else if (b.type === 3) {
+      ctx.fillStyle = TILE_COLORS[3];
+      ctx.fillRect(x, y, TILE, TILE);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(x+6, y+6, 4, 4);
+    }
+  }
+  // draw coins
+  for (let c of coins) {
+    if (c.collected) continue;
+    const cx = c.x * TILE - camX;
+    const cy = c.y * TILE;
+    if (cx < -10 || cx > V_WIDTH+10) continue;
+    ctx.fillStyle = '#ffdc55';
+    ctx.beginPath();
+    ctx.ellipse(cx+6, cy+6, 4, 4, 0,0,Math.PI*2);
+    ctx.fill();
+  }
+  // draw enemies
+  for (let e of enemies) {
+    const ex = e.x * TILE - camX;
+    const ey = e.y * TILE;
+    if (ex < -20 || ex > V_WIDTH+20) continue;
+    if (e.type === 'goomba') {
+      ctx.fillStyle = '#a55';
+      ctx.fillRect(ex+2, ey+2, 12, 12);
+      ctx.fillStyle = '#000'; ctx.fillRect(ex+4, ey+4, 2,2); ctx.fillRect(ex+10, ey+4,2,2);
+    } else if (e.type === 'koopa') {
+      ctx.fillStyle = '#3a8';
+      ctx.fillRect(ex+2, ey+2, 12, 12);
+      ctx.fillStyle = '#000'; ctx.fillRect(ex+6, ey+7, 4,4);
+    } else if (e.type === 'fly') {
+      ctx.fillStyle = '#f9a';
+      ctx.fillRect(ex+2, ey+2, 12, 8);
+      ctx.fillStyle = '#000'; ctx.fillRect(ex+5, ey+4, 2,2);
+    }
+  }
+}
+
+// Draw HUD: score, time, lives, coins
+function drawHUD() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(6,6, V_WIDTH-12, 28);
+  ctx.fillStyle = '#fff';
+  ctx.font = '10px monospace';
+  ctx.fillText('TITLE: スーパーTANABEブラザーズ', 12, 16);
+  ctx.fillText('TIME: ' + Math.floor(HUD.time), 12, 28);
+  ctx.fillText('COINS: ' + HUD.coins, 120, 28);
+  // players info on top right
+  ctx.fillStyle = '#fff';
+  ctx.fillText(players[0].name + ' S:' + players[0].lives, V_WIDTH - 150, 16);
+  ctx.fillText(players[1].name + ' S:' + players[1].lives, V_WIDTH - 150, 28);
+}
+
+// Title and menus
+function drawTitle() {
+  // background
+  ctx.fillStyle = '#3aa';
+  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
+  // big Japanese logo text (pixel-style)
+  ctx.fillStyle = '#fff';
+  ctx.font = '20px monospace';
+  ctx.fillText('スーパーTANABEブラザーズ', 28, 60);
+  ctx.font = '10px monospace';
+  ctx.fillText('Press Enter to Start', 110 + Math.sin(titleTick/300)*6, 120);
+  ctx.fillText('P1: WASD (W jump)  P2: Arrow Keys (Up jump)', 50, 140);
+  ctx.fillText('Mobile: Left tap=P1 jump, Right tap=P2 jump', 24, 152);
+  // draw tiny characters
+  ctx.save();
+  ctx.translate(80,80);
+  // P1 sprite
+  ctx.fillStyle = '#aaa'; ctx.fillRect(0,0,24,24);
+  ctx.fillStyle = '#6b4020'; ctx.fillRect(32,0,24,24);
+  ctx.restore();
+}
+
+// Gameover screen
+function drawGameOver() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
+  ctx.fillStyle = '#fff';
+  ctx.font = '18px monospace';
+  ctx.fillText('GAME OVER', 110, 80);
+  ctx.font = '10px monospace';
+  ctx.fillText('Press Enter to go to Title', 90, 110);
+}
+
+function loop(now) {
+  const dt = Math.min(1000/30, now - lastTime);
+  lastTime = now;
+  acc += dt;
+  // Run update at fixed steps
+  while (acc >= 1000/FPS) {
+    update(1000/FPS);
+    acc -= 1000/FPS;
+  }
+  // render
+  render();
+  requestAnimationFrame(loop);
+}
+
+function render() {
+  // clear
+  ctx.fillStyle = '#6ad';
+  ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
+
+  if (gameState === 'title') {
+    drawTitle();
+  } else if (gameState === 'playing') {
+    drawLevel();
+    drawPlayers();
+    drawHUD();
+  } else if (gameState === 'level_end') {
+    // show level clear screen
+    drawLevel();
+    drawPlayers();
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0,0,V_WIDTH,V_HEIGHT);
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.fillText('LEVEL CLEARED!', 100, 90);
+    ctx.font = '10px monospace';
+    ctx.fillText('Press Enter to Restart', 100, 110);
+  } else if (gameState === 'gameover') {
+    drawGameOver();
+  }
+}
+
+// Kick off loop
+requestAnimationFrame(loop);
+
+// Allow Enter on title/level_end/gameover to start/restart
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    if (gameState === 'title' || gameState === 'gameover') startGame();
+    else if (gameState === 'level_end') startGame();
+  }
+});
+
+// Small additional polish: allow manual coin spawn by hitting blocks with jump - simplified simulation
+// Check jumping and blocks: when player's head intersects a ? block tile above ground-level blocks, release coin/mushroom/star
+setInterval(()=> {
+  if (gameState !== 'playing') return;
+  for (let p of players) {
+    if (p.vy < -1) {
+      // check for blocks near player's head
+      for (let b of blocks) {
+        // compute block pixel pos
+        const bx = (b.x|0)*TILE;
+        let by = b.floating ? (b.y|0)*TILE : V_HEIGHT - TILE*3;
+        if (p.x + p.widthPixels > bx && p.x < bx + TILE && Math.abs((p.y) - (by + TILE)) < 6) {
+          // hit block from below
+          if (b.type === 3 && !b.used) {
+            b.used = true;
+            if (b.content === 'coin') { HUD.coins++; HUD.score += 200; sfx('coin'); }
+            else if (b.content === 'mushroom') {
+              // spawn a mushroom that moves right
+              projectiles.push({type:'mushroom', x:bx+TILE, y:by, vx:0.6});
+              sfx('power');
+            } else if (b.content === 'star') {
+              projectiles.push({type:'star', x:bx+TILE, y:by, vx:0.6});
+            }
+          } else if (b.type === 2) {
+            // brick: if player big and hits, break
+            if (p.big) {
+              // destroy brick
+              const idx = blocks.indexOf(b);
+              if (idx>=0) blocks.splice(idx,1);
+              sfx('stomp'); HUD.score += 50;
+            } else {
+              // bump
+              sfx('stomp');
+            }
+          }
+        }
+      }
+    }
+  }
+}, 120);
+
+// Update projectiles (mushroom/star)
+setInterval(()=> {
+  if (gameState !== 'playing') return;
+  const toRemove = [];
+  for (let pr of projectiles) {
+    pr.x += pr.vx;
+    // pick up by players?
+    for (let p of players) {
+      const px = p.x; const py = p.y;
+      const prPx = pr.x; const prPy = pr.y;
+      if (Math.abs((px+8) - prPx) < 12 && Math.abs((py+8) - prPy) < 12) {
+        if (pr.type === 'mushroom') { p.big = true; p.bigTimer=12; HUD.score += 500; sfx('power'); }
+        else if (pr.type === 'star') { p.star = true; p.starTimer=8; HUD.score += 800; sfx('power'); }
+        toRemove.push(pr);
+      }
+    }
+    // if out of bounds remove
+    if (pr.x < 0 || pr.x > LEVEL_W * TILE) toRemove.push(pr);
+  }
+  for (let r of toRemove) { const i = projectiles.indexOf(r); if (i>=0) projectiles.splice(i,1); }
+}, 1000/30);
+
+// Draw projectiles in render stage by injecting into drawLevel function area? For simplicity, attach to loop via below hook:
+(function drawOverlayLoop(){
+  requestAnimationFrame(drawOverlayLoop);
+  if (gameState !== 'playing') return;
+  // draw projectiles on top
+  for (let pr of projectiles) {
+    const x = pr.x - camX;
+    const y = pr.y;
+    if (x < -10 || x > V_WIDTH+10) continue;
+    if (pr.type === 'mushroom') {
+      ctx.fillStyle = '#f55'; ctx.fillRect(x+2, y+2, 12, 12);
+    } else if (pr.type === 'star') {
+      ctx.fillStyle = '#ff0'; ctx.fillRect(x+2, y+2, 12, 12);
+    }
+  }
+})();
+
+// small helper: when clicking canvas, resume audio
+canvas.addEventListener('pointerdown', ()=> { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+
+// Instructions drawing to ensure visible on small screens
+// End of file
+</script>
+</body>
+</html>
